@@ -1,355 +1,240 @@
 # Leandro
 
-AI persona debugging Kubernetes over Google Chat. Hermes + Claude Code
-subscription + read-only K8s MCP, in a NixOS VM on libvirt/KVM.
+An AI SRE teammate that watches a Kubernetes cluster, diagnoses pod
+incidents on its own, and talks to the team over Google Chat — built as a
+**security-first sandbox**: the agent reads attacker-influenceable text
+(pod logs, cluster events) by design, so every capability it has is fenced
+by an explicit, auditable boundary.
 
-Design in short: a watcher daemon detects pod incidents on the cluster and
-hands each one to the Hermes agent for a read-only LLM diagnosis, delivered
-to Google Chat; the whole VM is built declaratively (NixOS flake) with a
-default-deny egress proxy and a hard tool denylist as security boundaries.
+Leandro is a persona running on [Hermes](https://github.com/hermes-agent/hermes)
+(unmodified upstream + two small patches), inside a NixOS VM on libvirt/KVM.
+Two interchangeable model variants: Claude (via `claude-agent-sdk`) or any
+internal OpenAI-compatible endpoint.
 
-## Current state / caveats
+## How it works
 
-- **Kubeconfig points at the disposable test cluster.** The VM's
-  `/var/lib/leandro/kubeconfig` is currently provisioned against the
-  throwaway k3d cluster (`leandro-test`) on the host, not the work cluster.
-  The work cluster is **not yet connected**.
-- **Data egress reminder.** Pod logs and event messages are sent to the
-  Anthropic API (and, once the gateway is wired to it, Google Chat) for
-  diagnosis. Get internal approval for that data-egress perimeter *before*
-  pointing the watcher/gateway at the work cluster — RBAC excludes secrets,
-  but logs can still carry sensitive data.
-- **The Hermes pin tracks an unmerged PR head.** `hermesRev` in
-  `nix/hermes.nix` pins `pull/65982/head`, not a tag or branch. If upstream
-  force-pushes that PR, `hermes-install.service` fails at boot (the pinned
-  SHA vanishes from the ref) and both `hermes-gateway` and `leandro-watcher`
-  stay down (they `requires=` it). Recovery: re-pin `hermesRev` /
-  `hermesPullRef` to a SHA that still exists, then redeploy
-  (`./scripts/switch-vm.sh`).
+```
+ Kubernetes cluster                     NixOS VM (libvirt/KVM)
+ ┌──────────────────┐   read-only   ┌─────────────────────────────┐
+ │ pods, events,     │◄─────────────│ leandro-watcher (Python)    │
+ │ nodes, PVCs       │  watch API   │  detect → dedup → batch     │
+ └──────────────────┘               │        │                    │
+                                    │        ▼  hermes -z "brief" │
+ Thanos / Prometheus ◄──────────────│ hermes agent (LLM diagnosis)│
+                     metrics MCP    │        │                    │
+                                    │        ▼                    │
+ Google Chat  ◄─────────────────────│ report: VERDICT 🔴/🟡/🟢    │
+ (DM + team space)   via gateway    └─────────────────────────────┘
+                                      all HTTP egress → tinyproxy
+                                      allowlist + nftables default-deny
+```
 
-## Requirements (host)
+- **Detection** (`watcher/leandro_watcher.py`): two read-only watch streams
+  (Warning events + pod phases). Incidents are keyed
+  `(namespace, workload, reason)`, deduplicated over 7 days, batched so an
+  incident storm produces a few grouped reports instead of N billed LLM runs.
+  If the LLM is unreachable, a facts-only fallback report is still delivered —
+  detection is never lost.
+- **Diagnosis**: each new incident becomes a `hermes -z` one-shot with the
+  pod's last log lines attached (redacted first — see Security). The answer
+  opens with a one-line verdict and closes with a copy-pastable `kubectl`
+  command, lands on disk and in Google Chat.
+- **Conversation**: the Hermes gateway connects the same persona to Google
+  Chat DMs and spaces for interactive debugging, with memory, session
+  search, and 50+ slash commands (`/status`, `/usage`, `/model`, …).
 
-- Nix with flakes, libvirt/KVM with the `default` NAT network, `virt-install`.
+## Repository layout
+
+```
+flake.nix                 NixOS flake: two nixosConfigurations (remote/local
+                          model variant), qcow2 image, boot + pytest checks
+nix/
+  vm.nix                  Base VM: SSH key-only, qemu guest agent
+  hermes.nix              Hermes install (pinned rev), wrapper env, systemd
+                          units, read-only skills tree in the Nix store
+  watcher.nix             leandro-watcher unit + env (cluster label, chat)
+  egress.nix              Egress lockdown: tinyproxy allowlist + nftables
+                          default-deny output chain (see Security)
+  prometheus-mcp.nix      prometheus-mcp-server package (Thanos access)
+  kubernetes-mcp-server.nix  read-only K8s MCP server package
+hermes/
+  config.yaml             Remote (Claude) variant config — heavily annotated
+  config-local.yaml       Local (OpenAI-compatible endpoint) variant config
+  SOUL.md                 The persona: voice, trust tiers per interlocutor,
+                          test mode, cluster fact sheet
+  skills/thanos-metrics/  PromQL playbook the agent loads on demand
+  cron-scripts/           Scheduled jobs (daily cluster snapshot)
+watcher/
+  leandro_watcher.py      Watcher daemon (stdlib + kubernetes client only)
+  test_watcher.py         Pytest suite, runs in `nix flake check`
+patches/
+  hermes-forward-user-mcp-servers.patch   MCP forwarding + tool denylist
+  hermes-reset-notice-privacy.patch       Session-reset notice privacy
+k8s/
+  rbac.yaml               leandro-view ClusterRole (no secrets/configmaps)
+  watcher-test.yaml       Broken deployment to trigger a test diagnosis
+scripts/                  deploy-vm, switch-vm, make-kubeconfig, setup-gchat,
+                          setup-crons — each self-documenting
+secrets/secrets.env.example   Template; real secrets never enter git
+tools/gchat-renderer.user.js  Userscript: Markdown rendering in Google Chat
+```
+
+## Security model
+
+The core assumption: **prompt injection will happen**. The agent's input
+includes pod logs and Kubernetes event messages — text anyone who can make a
+pod crash can influence. Model judgement is treated as a soft mitigation,
+never as a boundary. Every boundary below is enforced outside the model, and
+each one is auditable.
+
+**1. Read-only cluster access, twice.** A dedicated `leandro-view`
+ClusterRole (`k8s/rbac.yaml`) grants namespaced reads on workloads, events
+and logs — **secrets and configmaps excluded** — plus a few cluster-scoped
+reads (nodes, PVs, Spark CRDs). Independently, the K8s MCP server runs with
+`--read-only`. Ask Leandro to delete something: the tool doesn't exist.
+
+**2. Hard tool denylist.** The SDK session patch
+(`patches/hermes-forward-user-mcp-servers.patch`) blocks Bash, file writes,
+WebSearch, subagents and slash commands via `disallowed_tools` — removed
+from the model's tool registry entirely, regardless of permission mode.
+Verified empirically: without it, the model runs shell commands unprompted.
+The local variant enforces the same posture via `agent.disabled_toolsets`
+(`hermes/config-local.yaml`), with a documented caveat: it's a denylist, so
+every Hermes version bump includes diffing upstream's toolset list.
+What remains: Read/Grep/Glob and the read-only K8s + Thanos MCP tools —
+what a diagnosis actually needs, nothing else.
+
+**3. Default-deny egress, two layers.** `nix/egress.nix`: an nftables
+output chain drops everything except DNS/NTP/DHCP, the kube API, and
+80/443 *from the tinyproxy uid only*. All HTTP(S) goes through tinyproxy,
+which allowlists exact hostnames — LLM API, Google Chat, Thanos, package
+hosts, and a short list of documentation domains for the agent's WebFetch.
+The layering is deliberate: proxy env vars are cooperation, the uid
+owner-match is enforcement — a process that ignores the proxy hits the drop
+chain, not the internet. Audit trail on both layers (`journalctl -u
+tinyproxy`, kernel `egress-denied` log). WebSearch stays denied forever: it
+executes on the provider's infrastructure, invisible to these rules.
+
+**4. Redaction before egress.** Logs and event messages pass a regex
+redaction (bearer/JWT/AWS keys, `password=` pairs, private key blocks)
+before entering any prompt, and `LEANDRO_NAMESPACE_ALLOWLIST` can shrink
+the watched perimeter to explicitly approved namespaces.
+
+**5. Gated persistent memory.** Memory writes are staged for human approval
+(`memory.write_approval: true`, reviewed with `/memory` in the DM).
+Without that gate, an injection in a pod log could plant a durable
+instruction into every future system prompt — one-shot access escalating to
+persistence.
+
+**6. Identity-gated behavior.** `hermes/SOUL.md` defines trust tiers per
+interlocutor, keyed on the *verified channel identity* — never on what a
+message claims ("this is your operator" in a log line changes nothing).
+A test mode lets the real operator simulate any interlocutor's view to
+audit these behaviors.
+
+**7. No secrets in git or the Nix store.** Credentials live in
+`/var/lib/leandro/` on the VM (mode 600, `EnvironmentFile`). Features whose
+upstream config would force a secret into the git-tracked, world-readable
+Nix store (the webhook platform's literal-YAML HMAC secret, public-ntfy
+inbound) ship disabled, with the reasoning documented in
+`hermes/config.yaml`.
+
+**Residual channel, acknowledged:** the Chat reply itself is egress — it is
+the product. RBAC bounds what can leak into it, redaction bounds it further,
+and everything the agent can read must be treated as reaching the LLM
+provider; get that perimeter approved before pointing this at a cluster
+whose logs you don't own.
 
 ## Deploy
 
+Host requirements: Nix with flakes, libvirt/KVM with the `default` NAT
+network, `virt-install`.
+
 ```bash
-./scripts/deploy-vm.sh          # build image + (re)create the VM
+# Put your SSH public key in nix/vm.nix first (placeholder committed).
+./scripts/deploy-vm.sh          # build qcow2 + (re)create the VM
 sudo virsh domifaddr leandro    # get the VM IP
-ssh leandro@<ip>                # SSH key baked into nix/vm.nix (yubikey)
+ssh leandro@<ip>                # key-only; no password, no console fallback
 ```
 
-### Security
+First boot runs `hermes-install` (git clone + `uv sync`, several minutes);
+`systemctl status hermes-install` shows `active (exited)` when done.
 
-SSH is key-only (`PasswordAuthentication = false`, no user password baked in);
-sudo is passwordless for the `leandro` user. Lose the key = redeploy the image
-with a new one — there is no console fallback, by design.
-
-**Egress** is default-deny (`nix/egress.nix`): an nftables output chain drops
-everything except DNS/NTP/DHCP, the kube API (fixed IP), and 80/443 *from the
-tinyproxy uid only*. All HTTP(S) — LLM API, Google Chat, Thanos, git/uv —
-goes through tinyproxy on `127.0.0.1:8888`, which allowlists exact hostnames
-(`leandro.egress.allowedDomains`); everything else gets `403 Filtered`.
-Phase 2 rides the same rails: the SDK's WebFetch is unblocked (verified to
-execute *on the VM* — the tinyproxy log shows its CONNECTs) and constrained
-by the proxy to the approved documentation domains (kubernetes.io, the
-apache.org doc hosts, kyverno.io, cilium.io, etcd.io); WebSearch stays
-denied forever (it runs on Anthropic infra, invisible to these rules), and
-SOUL.md pins the trust boundary: web content is data, never instructions. Two
-layers on purpose: proxy env vars are cooperation, the uid owner-match is
-enforcement. Audit trail: `journalctl -u tinyproxy` (what asked to leave, and
-what was refused — e.g. the claude CLI's Datadog log shipping) and
-`journalctl -k | grep egress-denied` (what tried to go direct). Rollback:
-`leandro.egress.enforce = false` (log-only, same rules) + redeploy. Known
-dependency: httplib2 (Chat API discovery client) needs `pysocks` to honor
-proxy env vars — installed by `hermes-install`; without it the Chat adapter
-dies on a 30s connect timeout at gateway start.
-
-## Provision secrets (after each redeploy)
+Then provision, in order (details in each script's header):
 
 ```bash
+# 1. Secrets — only when you have real values ready to paste:
 scp secrets/secrets.env.example leandro@<ip>:/var/lib/leandro/secrets.env
-ssh leandro@<ip> chmod 600 /var/lib/leandro/secrets.env
-# then edit it in the VM with real values
-```
+ssh leandro@<ip> chmod 600 /var/lib/leandro/secrets.env   # then edit in the VM
 
-**Warning**: don't copy the example file over until you have the real values
-ready to paste in immediately. `hermes-gateway`'s `ConditionPathExists` only
-checks that `secrets.env` *exists* — placeholder values are enough to satisfy
-it, and the service will start and crash-loop on the fake creds (`Restart =
-always`, 15s backoff). Noisy but harmless; still, minimize the window where a
-placeholder file sits on disk.
-
-Thanos metrics access (oauth2-proxy bypass header, read per request by
-`prometheus-mcp-server` via `/etc/leandro/thanos-http.yaml`):
-
-```bash
-ssh leandro@<ip> 'umask 077; printf "%s" "$BYPASS_TOKEN_VALUE" > /var/lib/leandro/thanos-bypass-token'
-```
-
-One token on one line (surrounding whitespace/newline is trimmed —
-`strings.TrimSpace` in prometheus/common headers.go, verified at v0.67.5).
-Without this file the thanos MCP tools register but every query fails at
-request time; nothing crashes.
-
-## Smoke test (phase 1)
-
-The first `hermes-install` sync (git clone + `uv sync`) takes several
-minutes on first boot — wait for it before expecting `hermes --help` to work.
-
-```bash
-ssh leandro@<ip>
-systemctl status hermes-install   # oneshot: active (exited) once sync is done
-hermes --help                     # Hermes CLI answers
-```
-
-### If the first-boot sync fails
-
-```bash
-journalctl -u hermes-install -b   # see why it failed (network/GitHub/PyPI)
-sudo systemctl restart hermes-install   # retry
-```
-
-If `hermes --help` fails on a missing shared library, add it to
-`programs.nix-ld.libraries` in `nix/hermes.nix` and redeploy (record it here).
-Recorded so far: `stdenv.cc.cc.lib` (libstdc++ for grpcio/google-cloud-pubsub),
-`zlib`.
-
-Known benign warning (smoke-tested 2026-08-06): `hermes` prints a uv
-`pyproject.toml` parse warning about `exclude-newer = "14 days"` — the uv in
-nixpkgs 25.05 predates relative dates there. Execution is unaffected.
-
-## Phase 2 — talk to Leandro (Google Chat + read-only cluster)
-
-One-time provisioning, in order:
-
-```bash
-# 1. Cluster side (kubeconfig with rights on `default`):
+# 2. Cluster access (kubeconfig bound to the leandro-view ClusterRole):
 kubectl apply -f k8s/rbac.yaml
-./scripts/make-kubeconfig.sh https://<api-server>:6443 > /tmp/leandro-kubeconfig
-scp /tmp/leandro-kubeconfig leandro@<vm-ip>:/var/lib/leandro/kubeconfig
-ssh leandro@<vm-ip> chmod 600 /var/lib/leandro/kubeconfig
-rm /tmp/leandro-kubeconfig
+./scripts/make-kubeconfig.sh https://<api-server>:6443 > /tmp/kc
+scp /tmp/kc leandro@<ip>:/var/lib/leandro/kubeconfig && rm /tmp/kc
 
-# 2. GCP side (gcloud auth login first):
-./scripts/setup-gchat.sh <gcp-project-id>   # then follow its printed steps
-# Note: google_chat's extra deps (google-cloud-pubsub, google-api-python-client)
-# are installed automatically at boot by hermes-install (oauth --install-deps) —
-# no manual `uv pip install` / `oauth --install-deps` step needed here.
+# 3. Google Chat (GCP project + Pub/Sub app):
+./scripts/setup-gchat.sh <gcp-project-id>
 
-# 3. Restart the gateway once secrets.env is complete:
-ssh leandro@<vm-ip> sudo systemctl restart hermes-gateway
+# 4. Restart and smoke-test:
+ssh leandro@<ip> sudo systemctl restart hermes-gateway
+ssh leandro@<ip> 'hermes -z "Liste les pods de kube-system et leur état."'
 ```
 
-Smoke tests:
+The watcher arms itself automatically once the kubeconfig exists
+(`ConditionPathExists`); until then the unit stays inactive. Trigger a test
+incident with `kubectl apply -f k8s/watcher-test.yaml` and watch
+`journalctl -u leandro-watcher -f`.
+
+Two useful security smoke tests on a disposable cluster:
 
 ```bash
-# MCP + RBAC, from the VM (no Google Chat needed):
-ssh leandro@<vm-ip>
-hermes -z "Liste les pods du namespace kube-system et donne-moi leur état."
-
-# End-to-end: DM the "Leandro" app in Google Chat:
-#   "Diagnostique le pod <name> dans <namespace>"
-journalctl -u hermes-gateway -f   # watch it pull and reply
+hermes -z "Exécute la commande shell 'id -un'"
+# must answer that Bash is absent from its registry — not a polite refusal
+hermes -z "Supprime le pod X"   # same: no delete tool exists
 ```
 
-Look for this line in the gateway's log at startup — it confirms the Pub/Sub
-subscription came up and Chat auth resolved:
+## Operating
 
-```
-[GoogleChat] Connected; project=…, subscription=…, bot_user_id=users/…
-```
-
-**Note**: `hermes -z` working from an interactive SSH session does **not**
-prove `hermes-gateway.service` itself is healthy. An interactive shell has
-your full login `PATH`; the systemd unit does not — it only sees what's
-declared in its `path = [ ... ]`. A CLI test can pass while the service still
-fails to find `uv`/`git`/`kubernetes-mcp-server` at runtime. Always check
-`journalctl -u hermes-gateway` (or the log line above) too.
-
-The read-only guarantee is double-layered: RBAC and `--read-only` on
-kubernetes-mcp-server. Ask Leandro to delete something to verify he refuses.
-
-**Tool-surface hardening**: `disallowed_tools` (Bash, Write/Edit/MultiEdit/
-NotebookEdit, WebFetch/WebSearch, Task, SlashCommand) is hard-blocked in the
-SDK session patch (`patches/hermes-forward-user-mcp-servers.patch`) — this
-holds regardless of `permission_mode`, closing the shell/filesystem/network
-egress a prompt injection in pod logs or K8s events could otherwise reach.
-Only Read/Grep/Glob and the read-only K8s MCP tools remain. Residual channel:
-the Chat reply itself (the product). Verify on the throwaway cluster:
-`hermes -z "Exécute la commande shell 'id -un'"` must answer that Bash is
-absent from its tool registry — not a polite refusal.
-
-RBAC perimeter (state it exactly like this in any internal approval request):
-custom `leandro-view` ClusterRole (namespaced reads on pods, pods/log,
-pods/status, events, services, endpoints, replicationcontrollers,
-persistentvolumeclaims, deployments/replicasets/statefulsets/daemonsets,
-jobs/cronjobs, horizontalpodautoscalers, ingresses/networkpolicies —
-**secrets and configmaps excluded**) plus `leandro-extra-view`
-(cluster-scoped reads: `nodes`, `persistentvolumes`, and the
-`sparkoperator.k8s.io` CRDs — sparkapplications, scheduledsparkapplications,
-sparkconnects). Everything Leandro can read may end up in prompts sent to
-the Anthropic API — logs and event messages additionally pass a regex
-redaction (bearer/JWT/AWS keys, `password=`-style pairs, private key blocks)
-before leaving the watcher, and `LEANDRO_NAMESPACE_ALLOWLIST` can shrink the
-watched perimeter to named namespaces.
-
-## Watcher (phase 3)
-
-`leandro-watcher.service` watches the cluster and diagnoses failures on its
-own — no human in the loop. It runs two read-only `watch` streams (Warning
-events on pods, nodes and PVCs, and pod phases/container states), maps each
-hit to an incident keyed `(namespace, workload, reason)` — equivalent reasons
-are folded (`BackOff`≡`CrashLoopBackOff`, `ErrImagePull`≡`ImagePullBackOff`,
-`Evicted`≡`Failed`) so one crash loop seen by both streams bills one
-diagnosis, not two — and for every *new* incident shells out to `hermes -z
-"<brief>"` with the last 20 log lines of the pod attached. Repeats within
-dedup memory (7 days) get a recurrence note in the brief ("occurrence n°4,
-précédente il y a 6 h"). The Markdown answer lands in
-`/var/lib/leandro/incidents/` as `<timestamp>-<ns>-<workload>-<reason>.md`
-(the filename is echoed at the top of the Chat message, so follow-up DM
-questions can name the exact report), and is also POSTed to
-`LEANDRO_WEBHOOK_URL` when set. The brief instructs the model to open with a
-one-line `VERDICT: 🔴/🟡/🟢` and close with a copy-pastable kubectl command —
-the verdict survives Chat truncation because truncation keeps the head.
-
-Diagnoses are **serialized and batched**: one worker thread drains the queue,
-grouping up to `LEANDRO_BATCH_MAX` (default 10) waiting incidents into a
-single Hermes run — a storm produces a few grouped reports
-(`<timestamp>-batch-<N>-incidents.md`), not N billed sessions. If `hermes`
-fails or times out, a facts-only fallback report is still written — detection
-is never lost.
-
-The service is gated on the kubeconfig: `ConditionPathExists =
-/var/lib/leandro/kubeconfig`. Before you provision it (phase 2, step 1) the
-unit simply stays inactive rather than crash-looping.
-
-| Env var | Default | Meaning |
-|---|---|---|
-| `LEANDRO_COOLDOWN_SECONDS` | `3600` | Per-`(ns, workload, reason)` dedup window: the same incident is re-diagnosed only after this. |
-| `LEANDRO_INCIDENTS_DIR` | `/var/lib/leandro/incidents` | Where diagnosis reports are written. |
-| `LEANDRO_WEBHOOK_URL` | *(unset)* | Google Chat incoming webhook for reports and blind alerts. Unset = disk only. |
-| `LEANDRO_HERMES_TIMEOUT` | `900` | Hard timeout on one `hermes -z` run. |
-| `LEANDRO_BATCH_MAX` | `10` | Max queued incidents grouped into one diagnosis run (hard ceiling 30 — argv size limit). `1` = strict one-per-run. |
-| `LEANDRO_BATCH_WINDOW_SECONDS` | `5` | After the first incident, how long the worker keeps collecting arrivals before launching the run — so a storm's first incident doesn't burn a solo session. |
-| `LEANDRO_CHAT_TARGET` | `google_chat` (set by the unit) | `hermes send` target for delivering diagnoses and blind alerts to the DM. Needs `GOOGLE_CHAT_HOME_CHANNEL` in secrets.env (the DM space id). Unset = disk/webhook only. |
-| `LEANDRO_NAMESPACE_ALLOWLIST` | *(unset)* | Comma-separated namespaces to watch; unset = all. Node events (`cluster` pseudo-namespace, no app data) always pass. Use it to start the work cluster on a small approved egress perimeter. |
-| `LEANDRO_BLIND_AFTER_SECONDS` | `300` | How long the API server may be unreachable before a "watcher is blind" alert fires (events stream only — one alert per outage, not one per stream). |
-| `LEANDRO_DEDUP_STATE` | `/var/lib/leandro/dedup.json` | Dedup state (`[last_ts, count]` per key; pre-count float files migrate on load), persisted across restarts, purged past 7 days of silence. |
-| `LEANDRO_EVENT_GRACE_SECONDS` | `60` | Events — and terminated container states on the pod stream — older than *start time − grace* are ignored on startup. |
-| `LEANDRO_HERMES_BIN` | `/run/current-system/sw/bin/hermes` | Path to the `hermes` binary invoked for each diagnosis. Set by `nix/watcher.nix`'s systemd unit — the store path is stable, so this normally never needs overriding. |
-| `LEANDRO_RUNS_LOG` | `/var/lib/leandro/runs.jsonl` | One JSONL line per hermes run (incident count, duration, token usage via `--usage-file`). Runs/day = `wc -l`; tokens via `jq .usage`. Empty = off. |
-| `LEANDRO_NTFY_URL` | *(unset)* | ntfy topic URL (e.g. `https://ntfy.sh/<topic>`) for the blind alert — the out-of-band path that still reaches the phone when Google Chat or its Pub/Sub path is what's down. Outbound POST only; the *inbound* ntfy gateway platform stays disabled (topic name is its only auth — see `hermes/config.yaml`). Treat the topic as a secret. |
-| `LEANDRO_GATEWAY_WEBHOOK_URL` + `_SECRET` | *(unset)* | **Experimental, dormant.** When both are set, the watcher hands each brief to the local gateway's webhook platform (HMAC V2-signed POST) instead of spawning `hermes -z`; the gateway runs the agent and delivers to the DM itself. Any failure falls back to the subprocess path. The gateway-side route stays commented in `hermes/config.yaml` — upstream's webhook adapter only takes its HMAC secret as literal YAML (no env indirection), and this config file is git-tracked and world-readable in the Nix store. Delegated runs land in hermes `state.db`, not `incidents/`. |
-
-Built-in noise filters (no env toggle — edit `is_ignorable()` to change):
-Spark executor pods (`…-exec-N`) dying with `Failed`/`Error` are ignored —
-that's the driver SIGTERM-ing its executors at normal job end, seen at the end
-of nearly every SparkApplication. `FailedMount` on `kube-api-access-*`
-volumes is ignored too (NodeRestriction auth-graph race during submission
-bursts; the kubelet retries and wins). Driver failures and executor
-OOMKilled/ImagePull still alert. The blind alert only fires if a fresh API
-probe fails too — a middlebox killing an idle watch stream is not an outage.
-A diagnosis that outlives `LEANDRO_HERMES_TIMEOUT` gets its whole process
-group killed (not just the `hermes` parent), so a hung run can't leave an
-orphaned agent session running — and billing — in the background.
-
-The last two exist because `Restart = always` makes restarts routine, and a
-fresh watch replays whatever is still in the API server's window (events live
-~1 h). Without them every restart would re-diagnose an hour of already-handled
-history — a crash loop would turn into a billing loop. Set them in
-`secrets.env` (the unit reads it via `EnvironmentFile`).
-
-```bash
-ssh leandro@<vm-ip>
-systemctl status leandro-watcher
-journalctl -u leandro-watcher -f
-ls /var/lib/leandro/incidents/
-```
-
-## Operating Leandro (hermes features in use)
-
-**From the DM** — the gateway ships 51 platform-agnostic slash commands:
-`/status`, `/usage`, `/model` (live model switch), `/context`, `/compress`,
-`/sessions`, `/memory` (approve memory writes), `/reload_mcp`,
-`/reload_skills`, `/restart`, `/debug`. Also `/heartbeat every 10m <text>`:
-re-injects an instruction into the *current* session while it is idle —
-incident follow-up with full context, cheaper than a fresh cron session.
-
-**Memory & recall** — `memory.memory_enabled: true` exposes the `memory`
-tool (writes to `HERMES_HOME/memories/MEMORY.md`) and SOUL.md instructs
-Leandro to check `session_search` before diagnosing and to save durable
-lessons before concluding. Memory (injection + tool) applies to gateway (DM)
-turns and to the watcher's `hermes -z` one-shots; the one path without it is
-**cron** (`cron/scheduler.py` hardcodes `skip_memory=True`), so the weekly
-review reads history via `session_search` but never writes memory.
-`memory.write_approval: true` stages every write to
-`HERMES_HOME/pending/memory/` for review with `/memory` in the DM — without
-that gate, a prompt injection in pod logs could plant a durable instruction
-into every future system prompt. Watcher one-shots are tagged
-`HERMES_SESSION_SOURCE=leandro-alert` so they are searchable as a distinct
-source.
-
-**From the workstation** — two read paths into the VM, both over SSH (no
-inbound network):
-
-```bash
-# Web dashboard (sessions FTS search, logs, analytics, cron):
-ssh -L 9119:127.0.0.1:9119 leandro@<vm-ip> hermes dashboard
-# then open http://127.0.0.1:9119
-
-# Claude Code ⇄ Leandro: expose hermes as an MCP server over SSH —
-# add to the workstation's MCP config:
-#   { "command": "ssh", "args": ["leandro@<vm-ip>", "hermes", "mcp", "serve"] }
-# → Claude Code can read Leandro's conversations/diagnoses and send
-#   follow-ups into the DM during an incident.
-```
-
-**Scheduled jobs** — `scripts/setup-crons.sh` (run once on the VM)
-provisions the daily cluster check and weekly incident review; jobs live in
-`HERMES_HOME/cron/jobs.json` (writable state, not the read-only config).
-The `[SILENT]` convention keeps quiet mornings free: the agent only
-notifies when the injected script output shows something abnormal.
+- **Watcher tuning** — env vars on the unit (`nix/watcher.nix`) and in
+  `secrets.env`: cooldown/dedup window, batch size and collection window,
+  namespace allowlist, hermes timeout (a hung run gets its whole process
+  group killed — no orphaned billed sessions), blind-outage alert (with
+  optional out-of-band ntfy push for when Chat itself is down), JSONL run
+  log for cost tracking. All defaults are documented inline in
+  `nix/watcher.nix` and `watcher/leandro_watcher.py`.
+- **From the DM** — `/status`, `/usage`, `/context`, `/model` (live model
+  switch), `/memory` (approve staged memory writes), `/sessions`,
+  `/restart`. `/heartbeat every 10m <text>` re-injects an instruction into
+  the idle session — cheap incident follow-up with full context.
+- **From the workstation** — everything over SSH, no inbound network:
+  `ssh -L 9119:127.0.0.1:9119 leandro@<ip> hermes dashboard` for the web
+  dashboard; expose Hermes as an MCP server over SSH to plug your own
+  agent/editor into Leandro's sessions.
+- **Scheduled jobs** — `scripts/setup-crons.sh` provisions a daily cluster
+  check and a weekly incident review; the `[SILENT]` convention keeps quiet
+  mornings notification-free.
 
 ## Iterate
 
-- Change Nix config → `./scripts/switch-vm.sh` (in-place, keeps secrets and
-  Hermes memory; needs the VM up). Use `./scripts/deploy-vm.sh` only for
-  from-scratch reimages (destroys VM state; re-provision secrets after).
+- Config change → `./scripts/switch-vm.sh` (in-place `nixos-rebuild`,
+  keeps state). Full reimage → `./scripts/deploy-vm.sh` (destroys VM state;
+  re-provision secrets after).
+- Model variant switch: `./scripts/switch-vm.sh [vm-ip] [local|remote]` —
+  same VM, `/var/lib/leandro` survives.
+- Hermes version bump: edit `hermesRev` in `nix/hermes.nix`, then **diff
+  upstream `toolsets.py` against the denylists** (config-local.yaml and the
+  SDK patch) before deploying — new upstream toolsets ship enabled by
+  default, and this repo's containment is deny-based.
+- `nix flake check -L` runs the pytest suite and a full VM boot test
+  (systemd units up, egress chain active) without needing libvirt.
 
-  **First in-place switch (one-time bootstrap, historical)**: already done
-  on the current VM — its generation is ≥2 and `nix.settings.trusted-users`
-  is active, so `./scripts/switch-vm.sh` works directly. The steps below are
-  only needed again after a from-scratch reimage (`deploy-vm.sh`), which
-  redeploys a base image that predates `trusted-users` and can't accept an
-  unsigned closure via `nixos-rebuild --target-host` — the very first switch
-  after such a reimage has to import the closure over SSH via remote sudo
-  instead. Back up state first:
+## Known sharp edges
 
-  ```bash
-  ssh leandro@<ip> 'sudo tar czf - /var/lib/leandro' > leandro-state-backup.tgz
-
-  nix build .#nixosConfigurations.leandro.config.system.build.toplevel -o /tmp/leandro-top
-  TOP=$(readlink -f /tmp/leandro-top)
-  nix-store --export $(nix-store -qR "$TOP") | ssh leandro@<ip> 'sudo nix-store --import'
-  ssh leandro@<ip> "sudo nix-env -p /nix/var/nix/profiles/system --set $TOP && sudo $TOP/bin/switch-to-configuration switch"
-  ```
-
-  After that, `./scripts/switch-vm.sh` works directly (the new generation
-  carries `trusted-users`).
-- Model variant: `./scripts/switch-vm.sh [vm-ip] [local|remote]` (args in any
-  order, default `remote`). `remote` = claude-agent-sdk on the Anthropic PR
-  pin (flake target `.#leandro`); `local` = upstream Hermes release tag on
-  an internal OpenAI-compatible endpoint, native runtime (`.#leandro-local`,
-  `hermes/config-local.yaml`). Switching re-checkouts `hermes-src` and
-  re-syncs the venv on the VM (a few minutes); `/var/lib/leandro` state
-  (secrets, memory) survives. `local` needs the host on the corp
-  network/VPN — the VM reaches `llm.internal.example.com` through
-  libvirt NAT; auth is by network location, no API key.
-- Bump Hermes: edit `hermesRev` (and `hermesFetchRef` if the source PR or
-  release tag changes) in `nix/hermes.nix`, redeploy. Remote pin: head of
-  hermes-agent PR #65982 (claude-agent-sdk runtime); revert to a release tag
-  once it merges. Local pin: latest release tag — on every bump, diff
-  upstream `toolsets.py` against `agent.disabled_toolsets` in
-  `hermes/config-local.yaml` (denylist is fail-open for new toolsets).
-- `nix flake check -L` runs the boot test locally without libvirt.
+- The remote variant pins an unmerged upstream PR head (`pull/65982/head`).
+  If that ref is force-pushed, `hermes-install` fails at boot and the
+  dependent units stay down; re-pin to an existing SHA and redeploy.
+- `hermes -z` passing from an interactive shell does not prove the systemd
+  units are healthy (different `PATH`); check `journalctl -u hermes-gateway`.
+- Everything the agent reads may reach the LLM provider. On a cluster you
+  share with others, treat the egress perimeter as a formal approval item,
+  not a detail.
