@@ -1,0 +1,52 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index b39ae8c..8fc10bc 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -940,6 +940,13 @@ class GatewayConfig:
+     # Unauthorized DM policy
+     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+ 
++    # Reset notices (manual /new-//reset replies and auto-reset
++    # notifications) append a session-info block: model, provider,
++    # context window. Set False to omit that block in multi-user chats.
++    # Gateway-emitted, so no system-prompt can suppress it -- only this.
++    # Upstream: NousResearch/hermes-agent#83344.
++    reset_notice_session_info: bool = True
++
+     # Streaming configuration
+     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+ 
+@@ -1073,6 +1080,7 @@ class GatewayConfig:
+             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
+             "loop_watchdog": self.loop_watchdog,
+             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
++            "reset_notice_session_info": self.reset_notice_session_info,
+             "streaming": self.streaming.to_dict(),
+             "session_store_max_age_days": self.session_store_max_age_days,
+             "profile_routes": [
+@@ -1211,6 +1219,9 @@ class GatewayConfig:
+             loop_watchdog=loop_watchdog,
+             max_concurrent_sessions=max_concurrent_sessions,
+             unauthorized_dm_behavior=unauthorized_dm_behavior,
++            reset_notice_session_info=_coerce_bool(
++                data.get("reset_notice_session_info"), True
++            ),
+             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+             session_store_max_age_days=session_store_max_age_days,
+             profile_routes=profile_routes,
+diff --git a/gateway/run.py b/gateway/run.py
+index 40be1f3..4434abd 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -18307,6 +18307,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         inside this method, so contextvars behave correctly in the worker
+         thread.
+         """
++        # Leandro patch (NousResearch/hermes-agent#83344): the single
++        # choke point both reset notices share -- omit model/provider
++        # when the operator disabled it for a multi-user chat.
++        if not getattr(getattr(self, "config", None), "reset_notice_session_info", True):
++            return ""
+         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                 return self._format_session_info()

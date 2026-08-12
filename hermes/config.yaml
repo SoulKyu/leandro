@@ -1,0 +1,136 @@
+model:
+  default: "claude-sonnet-5"
+  provider: "claude-agent-sdk"
+
+# Keep the model/provider/context block out of /new-//reset and auto-reset
+# notices in the shared team space — the gateway emits it itself, so only
+# this switch suppresses it (added by patches/hermes-reset-notice-privacy.patch,
+# upstream NousResearch/hermes-agent#83344).
+gateway:
+  reset_notice_session_info: false
+
+# Expire idle chat sessions. Without this (upstream default mode "none"),
+# DM/space threads live forever: context grows every turn (per-turn cost +
+# long-thread confabulation) and SOUL/config changes are only picked up
+# after a manual /new. A reset drops context, not knowledge — session_search
+# and MEMORY.md survive. Watcher `hermes -z` one-shots and cron are not
+# gateway sessions: unaffected. Reset notices stay privacy-safe in shared
+# spaces via reset_notice_session_info above.
+session_reset:
+  mode: both # idle 24 h OR daily 04:00 boundary, whichever fires first
+  at_hour: 4
+  idle_minutes: 1440
+
+# Browser hard-off, pinned preemptively: upstream's next release makes
+# "Browser Use mode" (agent-executed Python via browser_exec) the default
+# once this key is unset. Inert today, load-bearing after the next bump —
+# re-diff toolsets.py for browser_exec on every version bump.
+browser:
+  backend: "off"
+
+# Builtin persistent memory (MEMORY.md, bounded/curated, injected into the
+# system prompt). Upstream default is already true (hermes_cli/config_defaults.py)
+# — set explicitly so intent survives an upstream default flip. Applies to
+# gateway (chat) turns AND the watcher's `hermes -z` one-shots (oneshot.py →
+# AIAgent, skip_memory defaults False). The one path WITHOUT memory is cron:
+# cron/scheduler.py hardcodes skip_memory=True and drops the memory toolset —
+# the weekly review job can read via session_search but never writes memory.
+memory:
+  memory_enabled: true
+  # Gate memory writes behind /memory pending approval in the DM. Without it
+  # a prompt injection in pod logs could plant a durable instruction via the
+  # memory tool during a watcher one-shot (which has the tool — see above):
+  # one-shot → persistent escalation into every future turn's system prompt.
+  # Writes stage to HERMES_HOME/pending/memory/, reviewed with /memory.
+  write_approval: true
+
+# Gateway platforms are opt-in (PlatformConfig.enabled defaults to false);
+# credentials live in secrets.env, this only flips the switch.
+platforms:
+  google_chat:
+    enabled: true
+
+  # ntfy: DISABLED as an inbound platform. The adapter treats the topic name
+  # as the only auth ("user_id is fixed to the topic name", ntfy/adapter.py) —
+  # on public ntfy.sh anyone who learns the topic can DM Leandro (full agent
+  # turn, bypassPermissions) AND read his replies on the same topic: a
+  # bidirectional channel that routes around the whole tool denylist, since
+  # the reply itself is the egress. Re-enable only with a self-hosted/ACL'd
+  # server or a high-entropy secret topic + NTFY_TOKEN. Outbound-only push
+  # (the watcher blind alert via LEANDRO_NTFY_URL) does not need this block.
+  # ntfy:
+  #   enabled: true
+
+  # webhook: local HTTP server for the watcher's experimental gateway-delegated
+  # path. Left commented: the adapter only takes host/port/HMAC secret as
+  # literal YAML (no env-var support), and this file is git-tracked + world-
+  # readable in the Nix store — uncomment only with a secret you accept committing.
+  # webhook:
+  #   enabled: true
+  #   extra:
+  #     host: "127.0.0.1"   # MUST stay loopback — no auth in front of aiohttp
+  #     port: 8644          # DEFAULT_PORT in gateway/platforms/webhook.py
+  #     routes:
+  #       leandro-watcher:
+  #         secret: "REPLACE_ME_DO_NOT_COMMIT_REAL_SECRET"  # must match LEANDRO_GATEWAY_WEBHOOK_SECRET
+  #         # No "events" filter: the watcher's POST carries no event-type
+  #         # header, so omit "events" entirely (empty = accept all).
+  #         prompt: "{brief}"  # watcher POSTs {"brief": "<diagnosis prompt>"}
+  #         deliver: "google_chat"
+
+agent:
+  claude_agent_sdk:
+    # bypassPermissions: MCP/K8s tools must run unattended (watcher one-shots,
+    # gateway turns with no approver). Contained by: VM-only blast radius,
+    # read-only kubeconfig + --read-only MCP, SOUL forbids writes, and a
+    # hard disallowed_tools denylist (Bash, Write/Edit, WebFetch/WebSearch,
+    # Task…) injected by patches/hermes-forward-user-mcp-servers.patch —
+    # the exfiltration channels stay closed regardless of this mode.
+    permission_mode: "bypassPermissions"
+    # Per-query USD cap forwarded to the SDK's max_budget_usd (turn stops with
+    # error_max_budget_usd once exceeded). FinOps guardrail against a runaway
+    # tool-calling loop; 50 leaves ample headroom for deep diagnosis sessions
+    # (API-equivalent accounting on Max plan, no real spend within plan limits).
+    max_budget_usd: 50
+
+mcp_servers:
+  kubernetes:
+    command: "/run/current-system/sw/bin/kubernetes-mcp-server"
+    args: ["--read-only", "--kubeconfig", "/var/lib/leandro/kubeconfig"]
+  # Thanos metrics (query-only). Toolset: core only (query/range_query/series/
+  # labels/metadata/docs) — lifecycle (reload/quit) and TSDB-admin
+  # (snapshot/delete_series) tools never load. list_alerts/list_rules were
+  # removed on purpose: they proxy /api/v1/alerts|rules which have NO
+  # server-side filter, and this Thanos is global — measured 2026-08-11:
+  # 75k active alerts / 84 MiB (73k from dev-cluster-1) and 7k rules /
+  # 90 MiB per call, truncated into garbage. Alert state comes from the
+  # filterable ALERTS{k8s_cluster=...} metric instead (SOUL + skill).
+  # CAUTION: the flag's DEFAULT is `all` — never drop --mcp.tools entirely.
+  # Deliberately NO --prometheus.backend=thanos: that flag REPLACES the
+  # allowlisted toolset with the full thanos one (getToolset() in upstream
+  # pkg/mcp/registration.go — backend switch discards the filtered set;
+  # verified empirically, snapshot/tsdb_stats reappeared). Auth: oauth2-proxy
+  # bypass header, value read per-request from
+  # /var/lib/leandro/thanos-bypass-token via the http.config in /etc (see
+  # nix/hermes.nix) — no secret in this file. truncation-limit caps series
+  # dumped into the context per response (FinOps); the model can raise it
+  # per-call if a diagnosis truly needs more.
+  thanos:
+    command: "/run/current-system/sw/bin/prometheus-mcp-server"
+    # Egress lockdown note: the backend client's proxy is set via proxy_url
+    # in the http.config below — NOT env vars (prometheus/common ignores
+    # HTTPS_PROXY unless proxy_from_environment is set, and MCP servers are
+    # spawned with a sanitized env anyway). The kubernetes server needs
+    # nothing: its API has a direct nftables rule.
+    # web.listen-address 127.0.0.1:0: even in stdio mode the binary starts an
+    # exporter-toolkit web server (metrics/pprof), default *:8080 — a second
+    # concurrent instance (gateway + watcher one-shot + mcp test) dies on
+    # "address already in use" and the MCP connection just closes. Ephemeral
+    # loopback port: no collisions, nothing exposed on the NAT interface.
+    args: [
+      "--prometheus.url", "https://thanos.internal.example.com",
+      "--http.config", "/etc/leandro/thanos-http.yaml",
+      "--web.listen-address", "127.0.0.1:0",
+      "--mcp.tools", "core",
+      "--prometheus.truncation-limit", "200",
+    ]

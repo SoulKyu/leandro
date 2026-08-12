@@ -1,0 +1,8 @@
+result
+/secrets/secrets.env
+__pycache__/
+.pytest_cache/
+/secrets/*.json
+/gchat-sa.json
+*.tgz
+leandro-kubeconfig*

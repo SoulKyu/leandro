@@ -1,0 +1,102 @@
+# Read-only identity for Leandro.
+# - `leandro-view`: custom ClusterRole, get/list/watch on the namespaced
+#   workload/runtime objects Leandro needs to read. Secrets AND configmaps
+#   EXCLUDED by design — everything Leandro reads can end up in prompts sent
+#   to the Anthropic API, and configmaps are a frequent credentials carrier.
+# - `leandro-extra-view`: cluster-scoped objects `leandro-view` doesn't cover
+#   but the watcher's reasons need (FailedScheduling/Evicted → nodes,
+#   FailedMount/FailedAttachVolume → persistentvolumes) + the sparkoperator
+#   CRDs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: leandro
+  namespace: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: leandro-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: leandro
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leandro-view
+rules:
+  - apiGroups: [""]
+    resources:
+      - "pods"
+      - "pods/log"
+      - "pods/status"
+      - "events"
+      - "services"
+      - "endpoints"
+      - "replicationcontrollers"
+      - "persistentvolumeclaims"
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - "deployments"
+      - "replicasets"
+      - "statefulsets"
+      - "daemonsets"
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - "jobs"
+      - "cronjobs"
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources:
+      - "horizontalpodautoscalers"
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - "ingresses"
+      - "networkpolicies"
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: leandro-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: leandro-view
+subjects:
+  - kind: ServiceAccount
+    name: leandro
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leandro-extra-view
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources:
+      - "sparkapplications"
+      - "scheduledsparkapplications"
+      - "sparkconnects"
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: leandro-extra-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: leandro-extra-view
+subjects:
+  - kind: ServiceAccount
+    name: leandro
+    namespace: default

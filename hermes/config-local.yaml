@@ -1,0 +1,130 @@
+# Local-model variant (nixosConfigurations.leandro-local): upstream Hermes
+# release tag + an internal OpenAI-compatible endpoint, native
+# Hermes agent loop (no claude-agent-sdk, no local patch). The remote/Claude
+# variant lives in config.yaml — security rationale comments (ntfy, webhook)
+# are kept there and apply verbatim here.
+model:
+  default: "internal-code-assistant" # Qwen3-Next-80B-A3B-Instruct
+  provider: "custom"
+  base_url: "https://llm.internal.example.com/v1"
+  # No api_key: the endpoint authenticates by network location (corp
+  # network/VPN). Reachability from the VM rides libvirt NAT through the
+  # host's route — off-VPN, turns fail at connect time, nothing leaks.
+  # Explicit because auto-detection is unreliable for custom endpoints.
+  context_length: 262144
+
+# Same policy as config.yaml: bounded curated MEMORY.md in the system prompt,
+# writes gated behind /memory approval (prompt-injection containment — a pod
+# log must not plant a durable instruction).
+memory:
+  memory_enabled: true
+  write_approval: true
+
+platforms:
+  google_chat:
+    enabled: true
+  # ntfy / webhook: deliberately absent — see config.yaml for why enabling
+  # either is an unauthenticated bidirectional channel or a committed secret.
+
+# Long-thread hygiene for the 80B local model: its quality degrades well
+# before the 262k window fills, and the default compression threshold is
+# floored at 0.75×context (≈196k) for <512k-window models — far too late.
+# threshold_tokens fires at the LOWER of the ratio and this absolute count;
+# proactive_prune is the deterministic no-LLM prune of stale tool outputs
+# (upstream's own comment: without it, old tool output "rides in history and
+# is re-sent every turn"). min_tail_user_messages keeps the last real user
+# turns verbatim so compaction never eats the operator's actual questions.
+compression:
+  enabled: true
+  # 120k not 60k: the 80B holds up to ~100-120k in practice; lossy LLM
+  # compaction is deferred there, while the free deterministic prune below
+  # keeps firing early at 48k.
+  threshold_tokens: 120000
+  proactive_prune_tokens: 48000
+  min_tail_user_messages: 3
+
+# Same policy as config.yaml — see there for the full rationale (context
+# growth, stale SOUL until /new; reset drops context, not memory).
+session_reset:
+  mode: both # idle 24 h OR daily 04:00 boundary, whichever fires first
+  at_hour: 4
+  idle_minutes: 1440
+
+# Browser hard-off — see config.yaml for the full rationale (Browser Use
+# mode becomes upstream's default when unset; browser_exec = agent-written
+# Python execution). Redundant with disabled_toolsets (browser, terminal)
+# below, kept as an explicit second layer for the fail-open-on-bump denylist.
+browser:
+  backend: "off"
+
+agent:
+  # Native-runtime equivalent of the claude-agent-sdk disallowed_tools list
+  # injected by patches/hermes-forward-user-mcp-servers.patch: the prompt
+  # carries attacker-influenceable text (pod logs, k8s events), so no shell,
+  # filesystem, network egress, or delegation surface may exist — model
+  # judgement is not a boundary. disabled_toolsets applies globally: CLI
+  # (watcher `hermes -z` one-shots), gateway turns, and cron jobs (scheduler
+  # layers it on top). Left enabled: memory (write-gated above), todo,
+  # session_search, clarify, plus the read-only kubernetes MCP server below —
+  # what a diagnosis actually needs.
+  #
+  # CAVEAT (fail-open): this is a denylist — an upstream release that adds a
+  # NEW toolset ships enabled by default. Mitigated by the pinned tag in
+  # nix/hermes.nix: on every bump, diff upstream toolsets.py and extend this
+  # list before deploying.
+  #
+  # `skills` stays ENABLED: the skills tree is a read-only Nix-store symlink
+  # (nix/hermes.nix tmpfiles), so skill_manage's writes fail on EROFS — the
+  # durable-escalation path is closed by the filesystem, not by toolset
+  # granularity. skills_list/skill_view give Leandro the thanos-metrics
+  # playbook on demand.
+  disabled_toolsets:
+    # execution / filesystem
+    - terminal
+    - file
+    - code_execution
+    - delegation
+    - cronjob
+    - computer_use
+    # network egress
+    - web
+    - search
+    - x_search
+    - browser
+    - vision
+    - image_gen
+    - video_gen
+    - video
+    - bfl
+    - tts
+    # unused integrations (surface + schema cost)
+    - homeassistant
+    - kanban
+    - discord
+    - discord_admin
+    - yuanbao
+    - feishu_doc
+    - feishu_drive
+    - spotify
+    - project
+    - desktop_ui
+
+mcp_servers:
+  kubernetes:
+    command: "/run/current-system/sw/bin/kubernetes-mcp-server"
+    args: ["--read-only", "--kubeconfig", "/var/lib/leandro/kubeconfig"]
+  # Same entry as config.yaml — see there for the full rationale (toolset
+  # pruning, bypass-header auth via /etc http.config, truncation FinOps).
+  thanos:
+    command: "/run/current-system/sw/bin/prometheus-mcp-server"
+    # Egress lockdown: backend proxy set via proxy_url in the http.config
+    # (env vars ignored by prometheus/common) — see config.yaml.
+    # web.listen-address 127.0.0.1:0 — see config.yaml (port collision between
+    # concurrent instances; ephemeral loopback port).
+    args: [
+      "--prometheus.url", "https://thanos.internal.example.com",
+      "--http.config", "/etc/leandro/thanos-http.yaml",
+      "--web.listen-address", "127.0.0.1:0",
+      "--mcp.tools", "core", # NOT list_alerts/list_rules (85-90 MiB unfiltered global dumps — see config.yaml); default is `all`, never drop the flag
+      "--prometheus.truncation-limit", "200",
+    ]

@@ -1,0 +1,76 @@
+diff --git a/agent/transports/claude_agent_sdk_session.py b/agent/transports/claude_agent_sdk_session.py
+index 8365d4027..8d1735d13 100644
+--- a/agent/transports/claude_agent_sdk_session.py
++++ b/agent/transports/claude_agent_sdk_session.py
+@@ -900,6 +900,25 @@ class ClaudeAgentSdkSession:
+             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
+                 hermes_session_id=self._hermes_session_id
+             )
++        # Leandro patch: forward config.yaml mcp_servers (stdio) to the SDK —
++        # upstream PR #65982 only exposes its curated hermes-tools bridge.
++        try:
++            from hermes_cli.config import load_config_readonly
++            for _name, _cfg in ((load_config_readonly() or {}).get("mcp_servers") or {}).items():
++                if not isinstance(_cfg, dict) or _cfg.get("enabled") is False:
++                    continue
++                if _cfg.get("command"):
++                    mcp_servers[_name] = {
++                        "command": _cfg["command"],
++                        "args": list(_cfg.get("args") or []),
++                        "env": dict(_cfg.get("env") or {}),
++                    }
++                else:
++                    logger.warning(
++                        "mcp server %r has no command (url servers unsupported "
++                        "by this patch) — skipped", _name)
++        except Exception:
++            logger.warning("user mcp_servers forward failed", exc_info=True)
+ 
+         system_prompt: Any = {"type": "preset", "preset": "claude_code"}
+         if self._system_prompt_append:
+@@ -950,6 +969,45 @@ class ClaudeAgentSdkSession:
+             # _configured_setting_sources.
+             "setting_sources": _configured_setting_sources(),
+         }
++        # Leandro patch: hard-block Bash/Write/Edit/WebSearch/Task/SlashCommand
++        # via disallowed_tools regardless of permission_mode. This deployment
++        # runs unattended (no approval callback wired), and the prompt carries
++        # attacker-influenceable pod-log/event text, so model judgement alone
++        # is not a boundary (verified: without this, Bash runs unprompted on
++        # the VM). Read/Grep/Glob and the read-only K8s MCP tools stay available.
++        fields["disallowed_tools"] = [
++            "Bash",
++            "BashOutput",
++            "KillShell",
++            "Write",
++            "Edit",
++            "MultiEdit",
++            "NotebookEdit",
++            # WebFetch deliberately absent (egress phase 2): it executes ON
++            # the VM, so the tinyproxy allowlist (nix/egress.nix) constrains
++            # it to the approved doc domains. WebSearch stays denied forever:
++            # it runs on Anthropic infra, invisible to VM egress rules.
++            "WebSearch",
++            "Task",
++            "SlashCommand",
++        ]
++        # hermes-tools bridge has no config filter (EXPOSED_TOOLS is hardcoded),
++        # so trim here: deny web/browser/image/tts tools (egress risk + schema
++        # cost), generated from EXPOSED_TOOLS so an upstream addition is denied
++        # by default. Kept: skills_list/skill_view, memory/session_search shims.
++        try:
++            from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
++            _kept = {"skills_list", "skill_view"}
++            fields["disallowed_tools"] += [
++                f"mcp__hermes-tools__{name}" for name in EXPOSED_TOOLS
++                if name not in _kept
++            ]
++        except Exception:
++            # No tool list, no bridge: deny the whole server rather than
++            # silently exposing an unknown surface.
++            logger.warning("EXPOSED_TOOLS import failed — denying the whole "
++                           "hermes-tools bridge", exc_info=True)
++            fields["disallowed_tools"].append("mcp__hermes-tools")
+         if self._resume_session_id:
+             fields["resume"] = self._resume_session_id
+         # Default OFF (upstream-conservative): partial messages only when the
