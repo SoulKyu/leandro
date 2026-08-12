@@ -8,7 +8,9 @@ let
   # - "local": latest upstream release tag, native Hermes runtime against the
   #   internal OpenAI-compatible endpoint (hermes/config-local.yaml). No patch, no
   #   claude-agent-sdk extra. On bump: diff upstream toolsets.py against the
-  #   disabled_toolsets denylist in config-local.yaml (fail-open — see there).
+  #   disabled_toolsets denylist in config-local.yaml, enforced closed by
+  #   leandro-toolset-guard below (drift from the reviewed baseline fails the
+  #   agent units at start).
   isLocal = modelVariant == "local";
   hermesRev =
     if isLocal
@@ -18,6 +20,58 @@ let
   hermesConfig = if isLocal then ../hermes/config-local.yaml else ../hermes/config.yaml;
   hermesRepo = "https://github.com/NousResearch/hermes-agent";
   stateDir = "/var/lib/leandro";
+
+  # Fail-closed toolset invariant. The tool denylists (disabled_toolsets in
+  # config-local.yaml, disallowed_tools in the SDK patch) are the only barrier
+  # between an unattended agent reading attacker-influenceable pod logs and a
+  # shell/egress tool — and they are DENYLISTS: a Hermes bump that adds a new
+  # toolset ships it enabled. This guard turns "diff toolsets.py on every bump"
+  # from a remembered step into an enforced one: it hashes the installed
+  # toolsets.py against a git-committed, reviewed baseline and refuses to start
+  # the agent units on any drift (or if the file or baseline is missing).
+  # Ceiling: whole-file hash, so a benign edit inside toolsets.py also trips it
+  # — intended conservatism (any change to the tool-defining file gets a look).
+  # Refresh the baseline with scripts/refresh-toolsets-lock.sh after reviewing.
+  toolsetGuard = pkgs.writeShellScriptBin "leandro-toolset-guard" ''
+    set -euo pipefail
+    src="${stateDir}/hermes-src"
+    baseline="/etc/leandro/toolsets.sha256"
+    ts=$(${pkgs.findutils}/bin/find "$src" -name toolsets.py -print -quit 2>/dev/null || true)
+    if [ -z "$ts" ]; then
+      echo "toolset-guard: toolsets.py not found under $src — refusing to start (fail closed)." >&2
+      exit 1
+    fi
+    want=$(${pkgs.coreutils}/bin/tr -d '[:space:]' < "$baseline" 2>/dev/null || true)
+    case "$want" in
+      ""|REPLACE_ME*)
+        echo "toolset-guard: baseline not set. Run scripts/refresh-toolsets-lock.sh on the VM, commit hermes/toolsets.sha256, redeploy." >&2
+        exit 1 ;;
+    esac
+    got=$(${pkgs.coreutils}/bin/sha256sum "$ts" | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then
+      echo "toolset-guard: $ts changed vs reviewed baseline ($got != $want)." >&2
+      echo "Upstream toolset surface moved. Diff it, extend the denylist (disabled_toolsets / the SDK patch), then refresh hermes/toolsets.sha256 and redeploy." >&2
+      exit 1
+    fi
+    echo "toolset-guard: toolsets.py matches reviewed baseline ($got)."
+  '';
+
+  # Operator helper (run on the VM after a Hermes bump): print the installed
+  # toolsets.py hash to paste into hermes/toolsets.sha256 once the new toolset
+  # surface has been reviewed and the denylist extended. GitOps: the baseline
+  # is committed in the repo, not written to the VM.
+  refreshToolsetsLock = pkgs.writeShellScriptBin "refresh-toolsets-lock" ''
+    set -euo pipefail
+    src="''${1:-${stateDir}/hermes-src}"
+    ts=$(${pkgs.findutils}/bin/find "$src" -name toolsets.py -print -quit 2>/dev/null || true)
+    [ -n "$ts" ] || { echo "toolsets.py not found under $src" >&2; exit 1; }
+    sha=$(${pkgs.coreutils}/bin/sha256sum "$ts" | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+    echo "toolsets.py: $ts"
+    echo "sha256:      $sha"
+    echo
+    echo "Reviewed the diff and extended the denylist? Put this in hermes/toolsets.sha256:"
+    echo "$sha"
+  '';
 
   hermesWrapper = pkgs.writeShellScriptBin "hermes" ''
     set -euo pipefail
@@ -79,8 +133,14 @@ in
           - /var/lib/leandro/thanos-bypass-token
   '';
 
+  # Git-committed toolset baseline (see toolsetGuard above). Symlinked
+  # read-only from the store; refresh via scripts/refresh-toolsets-lock.sh.
+  environment.etc."leandro/toolsets.sha256".source = ../hermes/toolsets.sha256;
+
   environment.systemPackages = with pkgs; [
     hermesWrapper
+    toolsetGuard
+    refreshToolsetsLock
     k8sMcp
     promMcp
     uv
@@ -214,6 +274,9 @@ in
     serviceConfig = {
       User = "leandro";
       Environment = [ "HOME=${stateDir}" ];
+      # Fail closed if the upstream toolset surface drifted from the reviewed
+      # baseline before the agent ever handles a message (see toolsetGuard).
+      ExecStartPre = "${toolsetGuard}/bin/leandro-toolset-guard";
       ExecStart = "${hermesWrapper}/bin/hermes gateway";
       Restart = "always";
       RestartSec = 15;

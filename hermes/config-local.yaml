@@ -53,7 +53,7 @@ session_reset:
 # Browser hard-off — see config.yaml for the full rationale (Browser Use
 # mode becomes upstream's default when unset; browser_exec = agent-written
 # Python execution). Redundant with disabled_toolsets (browser, terminal)
-# below, kept as an explicit second layer for the fail-open-on-bump denylist.
+# below, kept as an explicit second layer for the denylist.
 browser:
   backend: "off"
 
@@ -68,10 +68,11 @@ agent:
   # session_search, clarify, plus the read-only kubernetes MCP server below —
   # what a diagnosis actually needs.
   #
-  # CAVEAT (fail-open): this is a denylist — an upstream release that adds a
-  # NEW toolset ships enabled by default. Mitigated by the pinned tag in
-  # nix/hermes.nix: on every bump, diff upstream toolsets.py and extend this
-  # list before deploying.
+  # CAVEAT: this is a denylist — an upstream release that adds a NEW toolset
+  # would ship it enabled. Enforced closed by leandro-toolset-guard
+  # (nix/hermes.nix): the agent units refuse to start when toolsets.py drifts
+  # from the reviewed baseline (hermes/toolsets.sha256), so a bump forces a
+  # diff + denylist extension before the agent runs again.
   #
   # `skills` stays ENABLED: the skills tree is a read-only Nix-store symlink
   # (nix/hermes.nix tmpfiles), so skill_manage's writes fail on EROFS — the

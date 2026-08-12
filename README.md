@@ -99,10 +99,18 @@ WebSearch, subagents and slash commands via `disallowed_tools` — removed
 from the model's tool registry entirely, regardless of permission mode.
 Verified empirically: without it, the model runs shell commands unprompted.
 The local variant enforces the same posture via `agent.disabled_toolsets`
-(`hermes/config-local.yaml`), with a documented caveat: it's a denylist, so
-every Hermes version bump includes diffing upstream's toolset list.
-What remains: Read/Grep/Glob and the read-only K8s + Thanos MCP tools —
-what a diagnosis actually needs, nothing else.
+(`hermes/config-local.yaml`). What remains: Read/Grep/Glob and the read-only
+K8s + Thanos MCP tools — what a diagnosis actually needs, nothing else.
+
+Both are *denylists*, so a Hermes bump that adds a new toolset would ship it
+enabled. That fail-open gap is closed by an enforced invariant, not a
+reminder: the agent units run a fail-closed `ExecStartPre` guard
+(`leandro-toolset-guard`, `nix/hermes.nix`) that hashes the installed
+`toolsets.py` against a git-committed, reviewed baseline
+(`hermes/toolsets.sha256`) and refuses to start on any drift. A version bump
+therefore *stops the agent* until someone reviews the new toolset surface,
+extends the denylist, and refreshes the baseline
+(`scripts/refresh-toolsets-lock.sh`).
 
 **3. Default-deny egress, two layers.** `nix/egress.nix`: an nftables
 output chain drops everything except DNS/NTP/DHCP, the kube API, and
@@ -185,6 +193,21 @@ The watcher arms itself automatically once the kubeconfig exists
 incident with `kubectl apply -f k8s/watcher-test.yaml` and watch
 `journalctl -u leandro-watcher -f`.
 
+Baseline the toolset guard once per deploy (the agent units fail closed until
+you do — see security model, point 2):
+
+```bash
+ssh leandro@<ip> refresh-toolsets-lock
+# review the toolsets.py surface, paste the printed sha into
+# hermes/toolsets.sha256, commit, then ./scripts/switch-vm.sh
+```
+
+Watched-perimeter reminder: with `LEANDRO_NAMESPACE_ALLOWLIST` unset the
+watcher watches **all** namespaces (every namespace's pod logs can reach the
+LLM provider) and logs a `WARNING` saying so at startup. Set the allowlist to
+scope it; `journalctl -u leandro-watcher | grep 'namespace perimeter'` shows
+the live perimeter.
+
 Two useful security smoke tests on a disposable cluster:
 
 ```bash
@@ -221,10 +244,13 @@ hermes -z "Supprime le pod X"   # same: no delete tool exists
   re-provision secrets after).
 - Model variant switch: `./scripts/switch-vm.sh [vm-ip] [local|remote]` —
   same VM, `/var/lib/leandro` survives.
-- Hermes version bump: edit `hermesRev` in `nix/hermes.nix`, then **diff
-  upstream `toolsets.py` against the denylists** (config-local.yaml and the
-  SDK patch) before deploying — new upstream toolsets ship enabled by
-  default, and this repo's containment is deny-based.
+- Hermes version bump: edit `hermesRev` in `nix/hermes.nix` and redeploy. The
+  toolset guard then **fails the agent units closed** until you diff upstream
+  `toolsets.py` against the denylists (config-local.yaml and the SDK patch),
+  extend them for any new toolset, and refresh the baseline
+  (`refresh-toolsets-lock` on the VM → paste into `hermes/toolsets.sha256` →
+  redeploy). Containment is deny-based, so this review is enforced, not
+  optional.
 - `nix flake check -L` runs the pytest suite and a full VM boot test
   (systemd units up, egress chain active) without needing libvirt.
 

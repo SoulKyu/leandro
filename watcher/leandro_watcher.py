@@ -1065,6 +1065,15 @@ def main() -> None:
     ]
     for t in threads:
         t.start()
+    # Announce the watched perimeter loudly: everything watched can reach the
+    # LLM provider, and the default (unset allowlist) is all namespaces.
+    if _NS_ALLOWLIST:
+        log.info("namespace perimeter: watching %s (+cluster events)",
+                 ", ".join(sorted(_NS_ALLOWLIST)))
+    else:
+        log.warning("namespace perimeter: watching ALL namespaces — every "
+                    "namespace's pod logs may reach the LLM provider. Set "
+                    "LEANDRO_NAMESPACE_ALLOWLIST to scope it.")
     log.info("leandro-watcher started (cooldown=%ss, dedup state=%s)",
              gate.cooldown, gate.state_path)
     while True:

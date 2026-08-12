@@ -46,6 +46,10 @@ in
         "LEANDRO_CLUSTER_NAME=prod-cluster-1"
       ];
       EnvironmentFile = "-${stateDir}/secrets.env";
+      # Fail closed if the installed Hermes toolset surface drifted from the
+      # reviewed baseline (nix/hermes.nix leandro-toolset-guard) — the watcher
+      # spawns `hermes -z` per incident, so it inherits the same tool posture.
+      ExecStartPre = "/run/current-system/sw/bin/leandro-toolset-guard";
       ExecStart = "${pythonEnv}/bin/python ${../watcher/leandro_watcher.py}";
       Restart = "always";
       RestartSec = 30;
