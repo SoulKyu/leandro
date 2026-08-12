@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  watcher-tests:
+    name: watcher tests (nix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # `nix flake check` also builds checks.leandro-boots, a full NixOS VM
+      # boot test that needs KVM and a heavy image build — too slow/flaky for
+      # CI. Build only the hermetic pytest check here; run the boot test
+      # locally with `nix flake check -L`.
+      - run: nix build -L .#checks.x86_64-linux.watcher-tests
+
+  trivy:
+    name: trivy (vuln · secret · misconfig)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          # Skipped, with reason:
+          # - redteam-payload.txt / leandro_watcher.py / test_watcher.py carry
+          #   intentional example secrets and redaction regexes for the
+          #   security tooling itself, not real credentials.
+          # - watcher-test.yaml is a deliberately broken Deployment used to
+          #   trigger a test diagnosis, not deployable infra. The real IaC
+          #   artifact (k8s/rbac.yaml, the least-privilege ClusterRole) is
+          #   still scanned.
+          skip-files: docs/security/redteam-payload.txt,watcher/leandro_watcher.py,watcher/test_watcher.py,k8s/watcher-test.yaml

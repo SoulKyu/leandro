@@ -1,5 +1,7 @@
 # Leandro
 
+[![CI](https://github.com/SoulKyu/leandro/actions/workflows/ci.yml/badge.svg)](https://github.com/SoulKyu/leandro/actions/workflows/ci.yml)
+
 An AI SRE teammate that watches a Kubernetes cluster, diagnoses pod
 incidents on its own, and talks to the team over Google Chat — built as a
 **security-first sandbox**: the agent reads attacker-influenceable text
