@@ -87,6 +87,13 @@ pod crash can influence. Model judgement is treated as a soft mitigation,
 never as a boundary. Every boundary below is enforced outside the model, and
 each one is auditable.
 
+These boundaries are not just asserted — they are checked. A 20-vector
+red-team prompt-injection payload plus its scoring rubric and mandatory
+log-based verification live in
+[`docs/security/prompt-injection-redteam.md`](docs/security/prompt-injection-redteam.md);
+it is the regression test to replay on every Hermes bump or policy change,
+where a single FAIL blocks deploy.
+
 **1. Read-only cluster access, twice.** A dedicated `leandro-view`
 ClusterRole (`k8s/rbac.yaml`) grants namespaced reads on workloads, events
 and logs — **secrets and configmaps excluded** — plus a few cluster-scoped
