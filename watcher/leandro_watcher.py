@@ -528,19 +528,37 @@ def post_gateway_webhook(url: str, secret: str, prompt: str) -> bool:
 _WEBHOOK_TEXT_MAX = 3800
 
 
-def _send_chat(target: str, text: str, hermes_bin: str) -> None:
+def _send_chat(target: str, text: str, hermes_bin: str,
+               thread: str | None = None) -> str | None:
     """Deliver a report into the Google Chat DM through `hermes send`
-    (reuses the gateway's credentials; no LLM involved)."""
+    (reuses the gateway's credentials; no LLM involved).
+
+    `thread` is a Google Chat thread resource name (`spaces/X/threads/Y`);
+    when set, the message is delivered into that thread via the
+    `<target>:<thread>` form (needs the hermes-gchat-thread-targeting
+    patch). Returns the sent message's own thread name when the platform
+    reports one, so a follow-up send can chain into the same thread —
+    None on failure or on an unpatched Hermes (flat delivery, old
+    behavior)."""
+    if thread:
+        target = f"{target}:{thread}"
     if len(text) > _WEBHOOK_TEXT_MAX:
         text = text[:_WEBHOOK_TEXT_MAX] + "\n… (tronqué — rapport complet sur disque)"
     try:
-        proc = subprocess.run([hermes_bin, "send", "-t", target, "-f", "-"],
+        proc = subprocess.run([hermes_bin, "send", "-t", target, "--json", "-f", "-"],
                               capture_output=True, text=True, timeout=120,
                               input=text)
         if proc.returncode != 0:
             log.error("hermes send failed rc=%s: %s", proc.returncode, proc.stderr[-400:])
+            return None
+        try:
+            return json.loads(proc.stdout).get("thread_name") or None
+        except (ValueError, TypeError, AttributeError):
+            # Unpatched Hermes / non-JSON output: flat delivery, no chaining.
+            return None
     except Exception:
         log.exception("chat delivery failed (report still on disk)")
+        return None
 
 
 def _post_webhook(webhook_url: str | None, text: str) -> None:
@@ -556,7 +574,8 @@ def _post_webhook(webhook_url: str | None, text: str) -> None:
 
 
 def deliver(report_md: str, inc: Incident, incidents_dir: str, webhook_url: str | None,
-            chat_target: str | None = None, hermes_bin: str = "hermes") -> Path:
+            chat_target: str | None = None, hermes_bin: str = "hermes",
+            chat_thread: str | None = None) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
     path = Path(incidents_dir) / f"{ts}-{inc.namespace}-{inc.workload}-{inc.reason}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,7 +591,8 @@ def deliver(report_md: str, inc: Incident, incidents_dir: str, webhook_url: str 
         # Chat readers (shared space) can't open the VM-local file — send a
         # plain correlation id instead of a filename that promises a document.
         chat_header = header.replace(f"📄 `{path.name}`", f"réf : `{path.stem}`")
-        _send_chat(chat_target, chat_header + report_md, hermes_bin)
+        _send_chat(chat_target, chat_header + report_md, hermes_bin,
+                   thread=chat_thread)
     return path
 
 
@@ -581,7 +601,8 @@ _batch_seq = itertools.count(1)
 
 def deliver_batch(report_md: str, incidents: list[Incident],
                   incidents_dir: str, webhook_url: str | None,
-                  chat_target: str | None = None, hermes_bin: str = "hermes") -> Path:
+                  chat_target: str | None = None, hermes_bin: str = "hermes",
+                  chat_thread: str | None = None) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
     # Sequence number: two same-size batches in the same second (e.g. instant
     # fallback failures draining a storm) must not overwrite each other.
@@ -596,7 +617,8 @@ def deliver_batch(report_md: str, incidents: list[Incident],
     if chat_target:
         # Same as deliver(): correlation id, not a filename, on the chat copy.
         chat_header = header.replace(f"📄 `{path.name}`", f"réf : `{path.stem}`")
-        _send_chat(chat_target, chat_header + report_md, hermes_bin)
+        _send_chat(chat_target, chat_header + report_md, hermes_bin,
+                   thread=chat_thread)
     return path
 
 
@@ -675,17 +697,18 @@ class DiagnosisRunner:
                 break
         return batch
 
-    def _send_heads_up(self, batch: list) -> None:
+    def _send_heads_up(self, batch: list) -> str | None:
         """Immediate detection ack in the chat, before the (slow) LLM pass.
 
         Facts only, no LLM — the reader knows detection happened within
         seconds, while the diagnosis (minutes) is still running. Redacted and
-        truncated the same as the prompt path. Same-thread linking would need
-        `hermes send` thread targeting, broken upstream for google_chat, so
-        two separate messages is the accepted ceiling.
+        truncated the same as the prompt path. Returns the ack message's
+        thread name (patches/hermes-gchat-thread-targeting.patch) so the
+        report can land in the same thread; None keeps the old flat
+        two-message behavior.
         """
         if not self.chat_target:
-            return
+            return None
         n = len(batch)
         cluster = f" sur *{self.cluster_name}*" if self.cluster_name else ""
         head = (f"🔍 Incident détecté{cluster}" if n == 1 else
@@ -704,16 +727,19 @@ class DiagnosisRunner:
             if i.recurrence:
                 block.append(f"*Récurrence* : {i.recurrence}")
             blocks.append("\n".join(block))
-        _send_chat(self.chat_target, "\n\n".join(blocks), self.hermes_bin)
+        return _send_chat(self.chat_target, "\n\n".join(blocks), self.hermes_bin)
 
-    def _deliver_any(self, report: str, batch: list) -> None:
+    def _deliver_any(self, report: str, batch: list,
+                     chat_thread: str | None = None) -> None:
         if len(batch) == 1:
             deliver(report, batch[0][0], self.incidents_dir, self.webhook_url,
-                    chat_target=self.chat_target, hermes_bin=self.hermes_bin)
+                    chat_target=self.chat_target, hermes_bin=self.hermes_bin,
+                    chat_thread=chat_thread)
         else:
             deliver_batch(report, [i for i, _ in batch],
                           self.incidents_dir, self.webhook_url,
-                          chat_target=self.chat_target, hermes_bin=self.hermes_bin)
+                          chat_target=self.chat_target, hermes_bin=self.hermes_bin,
+                          chat_thread=chat_thread)
 
     def _usage_tmp(self) -> str | None:
         if not self.runs_log:
@@ -757,8 +783,9 @@ class DiagnosisRunner:
             batch = self._collect()
             keys = [i.key for i, _ in batch]
             started = time.monotonic()
+            chat_thread = None
             try:
-                self._send_heads_up(batch)
+                chat_thread = self._send_heads_up(batch)
             except Exception:
                 # The ack is a nicety — it must never delay or kill the
                 # diagnosis worker (the only thread draining the queue).
@@ -819,12 +846,13 @@ class DiagnosisRunner:
                           time.monotonic() - started, usage_file)
             try:
                 if report is not None:
-                    self._deliver_any(report, batch)
+                    self._deliver_any(report, batch, chat_thread)
                 else:
                     # Facts-only fallback so detection is never lost.
                     facts = "\n\n".join(f"{i.reason} {i.namespace}/{i.pod}: {i.message}"
                                         for i, _ in batch)
-                    self._deliver_any(f"(diagnostic LLM indisponible)\n\n{facts}", batch)
+                    self._deliver_any(f"(diagnostic LLM indisponible)\n\n{facts}",
+                                      batch, chat_thread)
             except Exception:
                 # Own try/except: delivery writes to disk, so a full or
                 # read-only /var would otherwise kill the only worker thread

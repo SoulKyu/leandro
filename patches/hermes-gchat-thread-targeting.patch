@@ -1,0 +1,54 @@
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index ba11710..7bebe2b 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -3647,6 +3647,10 @@ async def _standalone_send(
+         body["thread"] = {"name": thread_id}
+ 
+     url = f"https://chat.googleapis.com/v1/{chat_id}/messages"
++    if thread_id:
++        # Without messageReplyOption the API silently ignores thread.name and
++        # starts a new thread — same requirement as _create_message above.
++        url += "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+     try:
+         import aiohttp as _aiohttp
+     except ImportError:
+@@ -3672,6 +3676,10 @@ async def _standalone_send(
+         return {
+             "success": True,
+             "message_id": payload.get("name"),
++            # Thread resource name of the sent message — lets callers chain
++            # follow-up sends into the same thread via the
++            # "<chat_id>:<thread_name>" target form.
++            "thread_name": (payload.get("thread") or {}).get("name"),
+         }
+     except asyncio.CancelledError:
+         raise
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index cf93756..20c73e3 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -33,6 +33,12 @@ _SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
+ # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
+ _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
+ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
++# Google Chat thread targets: "<space_or_dm>:<thread resource name>", e.g.
++# "spaces/AAAA:spaces/AAAA/threads/BBBB". The thread part is the full
++# resource name the API returns as message.thread.name.
++_GCHAT_THREAD_TARGET_RE = re.compile(
++    r"^\s*((?:spaces|users)/[A-Za-z0-9_-]+):(spaces/[A-Za-z0-9_-]+/threads/[A-Za-z0-9_-]+)\s*$"
++)
+ _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+ # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
+ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
+@@ -566,6 +572,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
+         split_idx = trimmed.rfind(":$")
+         if split_idx > 0:
+             return trimmed[:split_idx], trimmed[split_idx + 1 :], True
++    if platform_name == "google_chat":
++        match = _GCHAT_THREAD_TARGET_RE.fullmatch(target_ref)
++        if match:
++            return match.group(1), match.group(2), True
+     if platform_name == "weixin":
+         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
+         if match:

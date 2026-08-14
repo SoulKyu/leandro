@@ -631,11 +631,38 @@ def test_send_chat_truncates_long_reports(monkeypatch):
 def test_deliver_sends_to_chat_target(tmp_path, monkeypatch):
     import leandro_watcher as lw
     sent = []
-    monkeypatch.setattr(lw, "_send_chat", lambda target, text, hermes_bin: sent.append((target, text)))
+    monkeypatch.setattr(lw, "_send_chat",
+                        lambda target, text, hermes_bin, thread=None:
+                        sent.append((target, text, thread)))
     inc = Incident("prod", "api", "OOMKilled", "api-1", "oom")
     lw.deliver("diag", inc, incidents_dir=str(tmp_path), webhook_url=None,
-               chat_target="google_chat", hermes_bin="h")
+               chat_target="google_chat", hermes_bin="h",
+               chat_thread="spaces/A/threads/T")
     assert sent and sent[0][0] == "google_chat" and "diag" in sent[0][1]
+    assert sent[0][2] == "spaces/A/threads/T"
+
+
+def test_send_chat_threads_follow_up_under_heads_up(monkeypatch):
+    """First send returns the thread name; passing it back must extend the
+    target so the report lands in the heads-up's thread."""
+    import leandro_watcher as lw
+    calls = []
+
+    def fake_run(cmd, capture_output, text, timeout, input):
+        calls.append(cmd)
+
+        class P:
+            returncode = 0
+            stderr = ""
+            stdout = ('{"success": true, "message_id": "spaces/A/messages/M",'
+                      ' "thread_name": "spaces/A/threads/T"}')
+        return P()
+
+    monkeypatch.setattr("leandro_watcher.subprocess.run", fake_run)
+    thread = lw._send_chat("google_chat:spaces/A", "ack", hermes_bin="h")
+    assert thread == "spaces/A/threads/T"
+    lw._send_chat("google_chat:spaces/A", "report", hermes_bin="h", thread=thread)
+    assert calls[1][3] == "google_chat:spaces/A:spaces/A/threads/T"
 
 
 def test_deliver_without_chat_target_does_not_send(tmp_path, monkeypatch):
@@ -1013,7 +1040,9 @@ def test_ping_blind_posts_to_ntfy(monkeypatch):
 def test_deliver_header_references_incident_file(tmp_path, monkeypatch):
     import leandro_watcher as lw
     sent = []
-    monkeypatch.setattr(lw, "_send_chat", lambda target, text, hermes_bin: sent.append(text))
+    monkeypatch.setattr(lw, "_send_chat",
+                        lambda target, text, hermes_bin, thread=None:
+                        sent.append(text))
     inc = Incident("prod", "api", "OOMKilled", "api-1", "oom")
     path = lw.deliver("diag", inc, incidents_dir=str(tmp_path), webhook_url=None,
                       chat_target="google_chat", hermes_bin="h")

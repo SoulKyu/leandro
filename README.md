@@ -9,7 +9,7 @@ text (pod logs, cluster events) by design, so every capability it has is
 fenced by an explicit, auditable boundary.
 
 Leandro is a persona running on [Hermes](https://github.com/hermes-agent/hermes)
-(unmodified upstream + two small patches), inside a NixOS VM on libvirt/KVM.
+(unmodified upstream + three small patches), inside a NixOS VM on libvirt/KVM.
 Two interchangeable model variants: Claude (via `claude-agent-sdk`) or any
 internal OpenAI-compatible endpoint.
 
@@ -77,6 +77,9 @@ watcher/
 patches/
   hermes-forward-user-mcp-servers.patch   MCP forwarding + tool denylist
   hermes-reset-notice-privacy.patch       Session-reset notice privacy
+  hermes-gchat-thread-targeting.patch     `hermes send` thread targeting fix
+                                          (watcher heads-up + report chained
+                                          in one Chat thread)
 k8s/
   rbac.yaml               leandro-view ClusterRole (no secrets/configmaps)
   watcher-test.yaml       Broken deployment to trigger a test diagnosis

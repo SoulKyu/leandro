@@ -228,6 +228,13 @@ in
         # and the pin advances past it.
         git -C hermes-src apply ${../patches/hermes-reset-notice-privacy.patch}
       ''}
+      # Google Chat thread targeting for `hermes send` (both variants, applies
+      # cleanly to the PR head and the release tag): upstream's standalone send
+      # path never parses the ":<thread>" part of a google_chat target and
+      # omits messageReplyOption, so the API silently ignores thread.name.
+      # Lets the watcher chain heads-up + report into one thread. Upstreamable
+      # as a bugfix PR; drop once merged.
+      git -C hermes-src apply ${../patches/hermes-gchat-thread-targeting.patch}
       cd hermes-src
       # Load-bearing extras — default `uv sync` omits them (and would
       # uninstall a lazy install on the next sync):
