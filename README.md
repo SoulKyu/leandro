@@ -29,6 +29,11 @@ internal OpenAI-compatible endpoint.
  (DM + team space)   via gateway    └─────────────────────────────┘
                                       all HTTP egress → tinyproxy
                                       allowlist + nftables default-deny
+                                        ┆
+                                        ┆ (optional, not implemented)
+                                        ▼
+                                      host-side mitmproxy credential
+                                      broker — real keys never in the VM
 ```
 
 - **Detection** (`watcher/leandro_watcher.py`): two read-only watch streams
@@ -131,6 +136,61 @@ owner-match is enforcement — a process that ignores the proxy hits the drop
 chain, not the internet. Audit trail on both layers (`journalctl -u
 tinyproxy`, kernel `egress-denied` log). WebSearch stays denied forever: it
 executes on the provider's infrastructure, invisible to these rules.
+
+Upstream Hermes ships
+[iron-proxy](https://hermes-agent.nousresearch.com/docs/user-guide/egress/iron-proxy),
+a credential-substituting egress proxy: the sandbox only holds opaque
+tokens, real keys never enter it. It is Docker-only today, so this VM-based
+deployment can't use it — tinyproxy + nftables cover the network side, but
+real credentials do live in the VM (`/var/lib/leandro/`, boundary 7). If
+iron-proxy grows past Docker, it is the natural upgrade path for closing
+that residual.
+
+The same property is reachable today with a host-side mitmproxy — shown in
+the architecture diagram as the optional credential broker. **Docs-only
+PoC, deliberately not implemented.** The trick: Google service-account auth
+only *signs* locally when acquiring a token; every later API call is a
+plain 1h-TTL Bearer. So the VM keeps a format-valid **dummy** key, and the
+broker re-signs the token request with the real key, which never leaves
+the host:
+
+```python
+# poc-mitm-broker.py — runs on the HOST; the VM only holds a dummy SA key
+import json, urllib.parse
+from google.auth import crypt, jwt
+from mitmproxy import http
+
+SA = json.load(open("/etc/leandro/real-sa.json"))     # mode 600, host-only
+SIGNER = crypt.RSASigner.from_service_account_info(SA)
+
+def request(flow: http.HTTPFlow) -> None:
+    if flow.request.pretty_host != "oauth2.googleapis.com":
+        return
+    form = dict(urllib.parse.parse_qsl(flow.request.get_text()))
+    if "assertion" not in form:
+        return
+    claims = jwt.decode(form["assertion"], verify=False)   # dummy-signed JWT
+    claims["iss"] = claims["sub"] = SA["client_email"]
+    form["assertion"] = jwt.encode(SIGNER, claims).decode()  # real signature
+    flow.request.set_text(urllib.parse.urlencode(form))
+```
+
+```bash
+# host: MITM only the token endpoint; everything else tunnels untouched
+mitmdump -s poc-mitm-broker.py --allow-hosts 'oauth2\.googleapis\.com'
+```
+
+VM side: trust the mitmproxy CA (system store *and* the Python/gRPC
+bundles — `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` for Pub/Sub) and chain
+tinyproxy upstream to the broker. A compromised VM then exfiltrates
+scoped, expiring tokens instead of a permanent private key. Not
+implemented because the CA-trust plumbing (three trust stores to keep
+aligned) outweighs the residual it closes at this project's scale; the
+LLM key has a simpler path (`ANTHROPIC_BASE_URL` → host reverse proxy
+injecting the real key). At fleet scale — several agents on different
+hosts sharing one broker — the production shape is Envoy
+(`credential_injector` filter + mTLS with per-agent policy) rather than
+mitmproxy.
 
 **4. Redaction before egress.** Logs and event messages pass a regex
 redaction (bearer/JWT/AWS keys, `password=` pairs, private key blocks)
