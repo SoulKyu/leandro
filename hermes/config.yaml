@@ -56,8 +56,10 @@ platforms:
   # turn, bypassPermissions) AND read his replies on the same topic: a
   # bidirectional channel that routes around the whole tool denylist, since
   # the reply itself is the egress. Re-enable only with a self-hosted/ACL'd
-  # server or a high-entropy secret topic + NTFY_TOKEN. Outbound-only push
-  # (the watcher blind alert via LEANDRO_NTFY_URL) does not need this block.
+  # server or a high-entropy secret topic + NTFY_TOKEN. The outbound blind
+  # alert no longer uses ntfy either: ntfy.sh is off the egress allowlist
+  # (nix/egress.nix) because a GET-reachable public board is an exfil channel
+  # for the LLM's WebFetch. The watcher's blind alert goes to Google Chat.
   # ntfy:
   #   enabled: true
 

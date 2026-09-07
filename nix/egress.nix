@@ -57,8 +57,13 @@ in
         "raw.githubusercontent.com"
         "pypi.org"
         "files.pythonhosted.org"
-        # Blind outbound alert when the LLM provider is down (LEANDRO_NTFY_URL)
-        "ntfy.sh"
+        # ntfy.sh deliberately NOT allowlisted: it is a public, subscribable
+        # message board reachable by GET, i.e. an exfil channel the LLM's
+        # WebFetch could reach (payload in the URL, attacker reads it back by
+        # subscribing to the topic — the collusion.wiki / DSEWiki pattern).
+        # The watcher's blind "provider down" alert goes to Google Chat
+        # instead (_ping_blind in watcher/leandro_watcher.py), which needs no
+        # extra egress here.
         # Phase 2 — upstream documentation, fetched FROM the VM so this proxy
         # constrains it. Exact hosts: tinyproxy matching is anchored,
         # subdomains must be spelled out.

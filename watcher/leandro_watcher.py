@@ -909,15 +909,10 @@ def _ping_blind(webhook_url: str | None, seconds: float,
             pass
     if chat_target:
         _send_chat(chat_target, msg, hermes_bin)
-    # ntfy is the out-of-band channel: if the blind spell is actually the
-    # VM's network (or Google Chat) being down, the two paths above die with
-    # it — a plain POST to ntfy.sh still gets a push onto the phone.
-    ntfy = os.environ.get("LEANDRO_NTFY_URL")
-    if ntfy:
-        try:
-            requests.post(ntfy, data=msg.encode(), timeout=10)
-        except Exception:
-            pass
+    # No ntfy fallback: a public GET-reachable board like ntfy.sh in the
+    # egress allowlist doubles as an exfil channel for the LLM's WebFetch
+    # (see nix/egress.nix). The provider being down still leaves Google Chat
+    # egress up, so the chat_target path above covers the primary case.
 
 
 class BlindGuard:

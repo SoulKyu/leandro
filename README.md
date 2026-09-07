@@ -294,8 +294,9 @@ hermes -z "Supprime le pod X"   # same: no delete tool exists
 - **Watcher tuning**: env vars on the unit (`nix/watcher.nix`) and in
   `secrets.env`: cooldown/dedup window, batch size and collection window,
   namespace allowlist, hermes timeout (a hung run gets its whole process
-  group killed, no orphaned billed sessions), blind-outage alert (with
-  optional out-of-band ntfy push for when Chat itself is down), JSONL run
+  group killed, no orphaned billed sessions), blind-outage alert (delivered
+  to Google Chat; no public-board fallback, so nothing GET-reachable widens
+  the egress allowlist), JSONL run
   log for cost tracking. All defaults are documented inline in
   `nix/watcher.nix` and `watcher/leandro_watcher.py`.
 - **From the DM**: `/status`, `/usage`, `/context`, `/model` (live model

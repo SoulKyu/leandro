@@ -1017,24 +1017,23 @@ def test_runner_creates_runs_log_dir_and_sweeps_orphans(tmp_path, monkeypatch):
     assert not orphan.exists()               # orphan swept at startup
 
 
-def test_ping_blind_posts_to_ntfy(monkeypatch):
+def test_ping_blind_goes_to_chat_never_ntfy(monkeypatch):
+    # The blind alert must reach Google Chat and must NOT touch any public
+    # board like ntfy.sh: such a board in the egress allowlist would double
+    # as a WebFetch exfil channel (see nix/egress.nix).
     import leandro_watcher as lw
     posts = []
-
-    def fake_post(url, **kwargs):
-        posts.append((url, kwargs))
-
-        class R:
-            status_code = 200
-
-            def raise_for_status(self):
-                pass
-        return R()
-
-    monkeypatch.setattr("leandro_watcher.requests.post", fake_post)
+    chats = []
+    monkeypatch.setattr("leandro_watcher.requests.post",
+                        lambda url, **kw: posts.append(url))
+    monkeypatch.setattr(lw, "_send_chat",
+                        lambda target, text, hermes_bin, thread=None:
+                        chats.append((target, text)))
+    # A stale env var must not resurrect the ntfy path.
     monkeypatch.setenv("LEANDRO_NTFY_URL", "https://ntfy.sh/leandro-x")
-    lw._ping_blind(None, 400.0)
-    assert any(u == "https://ntfy.sh/leandro-x" for u, _ in posts)
+    lw._ping_blind(None, 400.0, chat_target="google_chat", hermes_bin="h")
+    assert chats and chats[0][0] == "google_chat"
+    assert not any("ntfy.sh" in u for u in posts)
 
 
 def test_deliver_header_references_incident_file(tmp_path, monkeypatch):
