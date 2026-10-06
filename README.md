@@ -8,7 +8,7 @@ as a **security-first sandbox**: the agent reads attacker-influenceable
 text (pod logs, cluster events) by design, so every capability it has is
 fenced by an explicit, auditable boundary.
 
-Leandro is a persona running on [Hermes](https://github.com/hermes-agent/hermes)
+Leandro is a persona running on [Hermes](https://github.com/NousResearch/hermes-agent)
 (unmodified upstream + three small patches), inside a NixOS VM on libvirt/KVM.
 Two interchangeable model variants: Claude (via `claude-agent-sdk`) or any
 internal OpenAI-compatible endpoint.
